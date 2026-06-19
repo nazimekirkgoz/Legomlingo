@@ -6,6 +6,10 @@ import bleak
 import threading
 import asyncio
 
+import os
+import re
+import numpy as np
+
 # pylgbst libraries
 from pylgbst.hub import MoveHub
 from pylgbst.peripherals import VisionSensor
@@ -21,6 +25,67 @@ if not hasattr(bleak, "discover"):
         return await BleakScanner.discover(timeout=timeout, **kwargs)
     bleak.discover = custom_discover
 # ----------------------------------------
+
+# --- AUDIO GENERATION HELPER ---
+SAMPLE_RATE = 44100
+
+def generate_guitar_note(frequency, duration=1.0):
+    n_samples = int(SAMPLE_RATE * duration)
+    period = int(SAMPLE_RATE / frequency)
+    string = np.random.uniform(-1, 1, period)
+    samples = np.zeros(n_samples)
+    
+    decay = 0.996 # slightly faster decay for standard feedback sounds
+    
+    previous_val = 0
+    buffer = list(string)
+    output = []
+    for _ in range(n_samples):
+        val = buffer.pop(0)
+        avg = 0.5 * (val + previous_val)
+        new_val = avg * decay
+        buffer.append(new_val)
+        output.append(val)
+        previous_val = val
+    sound_array = np.array(output, dtype=np.float32)
+    sound_array = np.column_stack((sound_array, sound_array))
+    return pygame.sndarray.make_sound((sound_array * 32767).astype(np.int16))
+
+# --- VISUAL FEEDBACK HELPERS ---
+def draw_lego_brick(surface, x, y, color_rgb, size=(120, 60)):
+    w, h = size
+    shadow_color = tuple(max(0, c - 60) for c in color_rgb)
+    highlight_color = tuple(min(255, c + 50) for c in color_rgb)
+    
+    # Draw main brick shadow (rounded)
+    pygame.draw.rect(surface, shadow_color, (x + 4, y + 4, w, h), border_radius=8)
+    # Draw main brick body
+    pygame.draw.rect(surface, color_rgb, (x, y, w, h), border_radius=8)
+    # Draw main brick border/highlight
+    pygame.draw.rect(surface, highlight_color, (x, y, w, h), 2, border_radius=8)
+    
+    # Draw 2x4 studs
+    stud_r = min(w, h) // 10
+    dx = w // 4
+    dy = h // 2
+    for row in range(2):
+        for col in range(4):
+            cx = x + dx * col + dx // 2
+            cy = y + dy * row + dy // 2
+            # Stud shadow
+            pygame.draw.circle(surface, shadow_color, (cx + 1, cy + 1), stud_r)
+            # Stud body
+            pygame.draw.circle(surface, color_rgb, (cx, cy), stud_r)
+            # Stud highlight
+            pygame.draw.circle(surface, highlight_color, (cx, cy), stud_r, 1)
+
+def get_word_image_path(word):
+    # Replace German umlauts
+    w = word.lower().strip()
+    w = w.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue").replace("ß", "ss")
+    # Keep only alphanumeric characters
+    w = re.sub(r'[^a-z0-9]', '', w)
+    return f"images/{w}.png"
 
 # --- SETTINGS ---
 LEGO_MAC_ADRESI = '00:16:53:C1:B6:DD' 
@@ -60,7 +125,8 @@ WORD_POOLS = {
         {"word": "Arm", "article": "Der", "plural": "Arme", "def": "Verbindet Hand und Schulter."},
         {"word": "Bein", "article": "Das", "plural": "Beine", "def": "Zum Stehen und Gehen."},
         {"word": "Kopf", "article": "Der", "plural": "Köpfe", "def": "Ganz oben am Körper."},
-        {"word": "Haar", "article": "Das", "plural": "Haare", "def": "Wächst auf dem Kopf."}
+        {"word": "Haar", "article": "Das", "plural": "Haare", "def": "Wächst auf dem Kopf."},
+        {"word": "Mädchen", "article": "Das", "plural": "Mädchen", "def": "Ein junges weibliches Kind."}
     ],
     "KLASSE_2": [
         # Nature, Seasons, House (2. Klasse)
@@ -147,7 +213,8 @@ WORD_POOLS = {
         {"word": "Tasse", "article": "Die", "plural": "Tassen", "def": "Für Kaffee oder Tee."},
         {"word": "Teller", "article": "Der", "plural": "Teller", "def": "Darauf liegt das Essen."},
         {"word": "Gabel", "article": "Die", "plural": "Gabeln", "def": "Zum Aufspießen."},
-        {"word": "Löffel", "article": "Der", "plural": "Löffel", "def": "Für Suppe."}
+        {"word": "Löffel", "article": "Der", "plural": "Löffel", "def": "Für Suppe."},
+        {"word": "Mädchen", "article": "Das", "plural": "Mädchen", "def": "Ein junges weibliches Kind."}
     ],
     "LEVEL_A2": [
         # Work, Travel, Shopping (A2)
@@ -299,6 +366,19 @@ class GermanGame:
              logging.error(f"Could not load robot sound: {e}")
              self.kiomi_sound = None
 
+        # Pre-generate feedback sounds
+        try:
+            self.sound_der = generate_guitar_note(392.00, 1.2) # G4 (Der - Blue)
+            self.sound_die = generate_guitar_note(329.63, 1.2) # E4 (Die - Red)
+            self.sound_das = generate_guitar_note(523.25, 1.2) # C5 (Das - Green)
+            self.sound_wrong = generate_guitar_note(150.00, 0.8) # Low buzz (Wrong)
+        except Exception as e:
+            logging.error(f"Could not generate feedback sounds: {e}")
+            self.sound_der = None
+            self.sound_die = None
+            self.sound_das = None
+            self.sound_wrong = None
+
         self.splash_start = 0
         self.intro_start_time = 0
         self.intro_played = False
@@ -439,10 +519,19 @@ class GermanGame:
                 self.feedback_color = (50, 200, 50) 
                 self.timer_start = time.time()
                 if self.hub: self.hub.led.set_color(5) 
+                
+                # Play correct gender sound
+                art = self.target_word['article']
+                if art == "Der" and self.sound_der: self.sound_der.play()
+                elif art == "Die" and self.sound_die: self.sound_die.play()
+                elif art == "Das" and self.sound_das: self.sound_das.play()
             else:
                 # WRONG
                 self.wrong_attempts += 1
                 if self.hub: self.hub.led.set_color(9) 
+                
+                # Play wrong sound
+                if self.sound_wrong: self.sound_wrong.play()
                 
                 if self.wrong_attempts >= 2:
                     # GAME OVER - 2 Versuche vorbei (Global)
@@ -686,7 +775,8 @@ class GermanGame:
         elif self.state == STATE_FEEDBACK:
             self.draw_text_centered(self.feedback_message, self.font_xl, self.feedback_color, content_y - 50)
             
-            card_rect = pygame.Rect(cx - 300, content_y + 20, 600, 200)
+            card_h = 220
+            card_rect = pygame.Rect(cx - 300, content_y + 20, 600, card_h)
             pygame.draw.rect(self.screen, (240, 240, 250), card_rect, border_radius=15)
             pygame.draw.rect(self.screen, self.feedback_color, card_rect, 3, border_radius=15)
             
@@ -694,11 +784,36 @@ class GermanGame:
             word = self.target_word['word']
             plural = self.target_word['plural']
             
-            full_word_surf = self.font_xl.render(f"{art} {word}", True, (0, 0, 0))
-            self.screen.blit(full_word_surf, full_word_surf.get_rect(center=(cx, content_y + 80)))
+            # Fetch gender color
+            gender_color = ARTICLES.get(art, {"rgb": (0, 0, 0)})["rgb"]
+            
+            # Try to load custom image
+            img_path = get_word_image_path(word)
+            word_image = None
+            if os.path.exists(img_path):
+                try:
+                    word_image = pygame.image.load(img_path)
+                    word_image = pygame.transform.scale(word_image, (140, 140))
+                except Exception as e:
+                    logging.error(f"Error loading image {img_path}: {e}")
+            
+            # Draw visual asset (either custom image or 3D Lego brick) on the left side of the card
+            asset_x = cx - 260
+            asset_y = content_y + 20 + (card_h - 140) // 2
+            
+            if word_image:
+                self.screen.blit(word_image, (asset_x, asset_y))
+            else:
+                draw_lego_brick(self.screen, asset_x + 10, asset_y + 35, gender_color, size=(120, 70))
+            
+            # Draw Word & Plural on the right side of the card
+            text_area_cx = cx + 80
+            
+            full_word_surf = self.font_xl.render(f"{art} {word}", True, gender_color)
+            self.screen.blit(full_word_surf, full_word_surf.get_rect(center=(text_area_cx, content_y + 85)))
             
             plural_surf = self.font_l.render(f"Die {plural}", True, (100, 100, 100))
-            self.screen.blit(plural_surf, plural_surf.get_rect(center=(cx, content_y + 150)))
+            self.screen.blit(plural_surf, plural_surf.get_rect(center=(text_area_cx, content_y + 155)))
 
         elif self.state == STATE_GAME_OVER or self.state == STATE_VICTORY:
             title = "SPIEL VORBEI" if self.state == STATE_GAME_OVER else "GEWONNEN!"
